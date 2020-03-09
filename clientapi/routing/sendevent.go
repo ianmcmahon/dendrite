@@ -145,6 +145,9 @@ func generateSendEvent(
 	stateEvents := make([]*gomatrixserverlib.Event, len(queryRes.StateEvents))
 	for i := range queryRes.StateEvents {
 		stateEvents[i] = &queryRes.StateEvents[i]
+		if stateEvents[i].Type() == "m.room.power_levels" {
+			util.GetLogger(req.Context()).Info("Retrieved this PL event: ", string(stateEvents[i].JSON()))
+		}
 	}
 	provider := gomatrixserverlib.NewAuthEvents(stateEvents)
 	if err = gomatrixserverlib.Allowed(*e, &provider); err != nil {

@@ -131,6 +131,12 @@ func (r *RoomserverQueryAPI) QueryLatestEventsAndState(
 	if err != nil {
 		return err
 	}
+	util.GetLogger(ctx).Info("state-snapshot-nid: ", currentStateSnapshotNID)
+	for _, se := range stateEntries {
+		if se.EventTypeNID == types.MRoomPowerLevelsNID {
+			util.GetLogger(ctx).Info("PL event-nid: ", se.EventNID)
+		}
+	}
 
 	stateEvents, err := r.loadStateEvents(ctx, stateEntries)
 	if err != nil {

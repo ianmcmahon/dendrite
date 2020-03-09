@@ -25,6 +25,7 @@ import (
 	"github.com/matrix-org/dendrite/roomserver/api"
 	"github.com/matrix-org/dendrite/roomserver/types"
 	"github.com/matrix-org/gomatrixserverlib"
+	"github.com/matrix-org/util"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -126,7 +127,9 @@ func (d *Database) StoreEvent(
 				return err
 			}
 		}
-
+		if event.Type() == "m.room.power_levels" {
+			util.GetLogger(ctx).Info("insertEventJSON PL event-nid:", eventNID, " room:", event.RoomID(), " sender:", event.Sender(), " content:", string(event.Content()))
+		}
 		if err = d.statements.insertEventJSON(ctx, txn, eventNID, event.JSON()); err != nil {
 			return err
 		}
