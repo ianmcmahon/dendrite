@@ -297,11 +297,18 @@ func (t *txnReq) processEventWithMissingState(e gomatrixserverlib.Event, roomVer
 	// event ids and then use /event to fetch the individual events.
 	// However not all version of synapse support /state_ids so you may
 	// need to fallback to /state.
-	// TODO: Attempt to fill in the gap using /get_missing_events
+
+	// Attempt to fill in the gap using /get_missing_events
+	ok, err := t.getMissingEvents(e, roomVersion)
+	if err != nil {
+		return err
+	}
+	if ok {
+		return nil
+	}
 
 	// Attempt to fetch the missing state using /state_ids and /events
 	var respState *gomatrixserverlib.RespState
-	var err error
 	respState, err = t.lookupMissingStateViaStateIDs(e, roomVersion)
 	if err != nil {
 		// Fallback to /state
@@ -444,4 +451,87 @@ func (t *txnReq) createRespStateFromStateIDs(stateIDs gomatrixserverlib.RespStat
 		return nil, err
 	}
 	return &respState, nil
+}
+
+// getMissingEvents return ok=true if missing events were fetched and handled, else false. Returns an error only if we should
+// terminate the transaction which initiated /get_missing_events
+func (t *txnReq) getMissingEvents(e gomatrixserverlib.Event, roomVersion gomatrixserverlib.RoomVersion) (ok bool, err error) {
+	logger := util.GetLogger(t.context).WithField("event_id", e.EventID()).WithField("room_id", e.RoomID())
+	// query latest events (forward extremities)
+	req := api.QueryLatestEventsAndStateRequest{
+		RoomID:       e.RoomID(),
+		StateToFetch: []gomatrixserverlib.StateKeyTuple{},
+	}
+	var res api.QueryLatestEventsAndStateResponse
+	if err := t.rsAPI.QueryLatestEventsAndState(t.context, &req, &res); err != nil {
+		logger.WithError(err).Warn("Failed to query latest events")
+		return false, nil
+	}
+	latestEvents := make([]string, len(res.LatestEvents))
+	for i := range res.LatestEvents {
+		latestEvents[i] = res.LatestEvents[i].EventID
+	}
+	// security: this server just sent us an event for which we do not know its prev_events - ask that server for those prev_events.
+	// https://github.com/matrix-org/synapse/pull/3456
+	// https://github.com/matrix-org/synapse/blob/229eb81498b0fe1da81e9b5b333a0285acde9446/synapse/handlers/federation.py#L335
+	missingResp, err := t.federation.LookupMissingEvents(t.context, t.Origin, e.RoomID(), gomatrixserverlib.MissingEvents{
+		Limit: 20,
+		// synapse uses the min depth they've ever seen in that room
+		MinDepth: 1,
+		// The latest event IDs that the sender already has. These are skipped when retrieving the previous events of latest_events.
+		EarliestEvents: latestEvents,
+		// The event IDs to retrieve the previous events for.
+		LatestEvents: []string{e.EventID()},
+	}, roomVersion)
+	if err != nil {
+		logger.WithError(err).Errorf(
+			"%s pushed us an event but couldn't give us details about prev_events via /get_missing_events - dropping this event until it can",
+			t.Origin,
+		)
+		return false, err
+	}
+
+	if !pathExists(missingResp.Events, e, latestEvents) {
+		return false, nil
+	}
+
+	// TODO: modify pathExists to return a valid path between the 2 events
+	return false, nil
+}
+
+// Attempts to find a path between fromEvent and toAnyEventIDs via events.
+// TODO: should exist in GMSL, does a DFS scan of the provided events trying to find a path toAnyEventIDs
+func pathExists(events []gomatrixserverlib.Event, fromEvent gomatrixserverlib.Event, toAnyEventIDs []string) bool {
+	eventIDMap := make(map[string]gomatrixserverlib.Event, len(events))
+	for _, ev := range events {
+		eventIDMap[ev.EventID()] = ev
+	}
+
+	stack := []string{}
+	stack = append(stack, fromEvent.PrevEventIDs()...)
+	seenOnStack := make(map[string]bool) // detect cycles
+
+	for len(stack) > 0 {
+		// pop from the stack
+		n := len(stack) - 1
+		next := stack[n]
+		stack = stack[:n]
+		if seenOnStack[next] {
+			continue
+		}
+		seenOnStack[next] = true
+
+		// check if prev_event is the target
+		for _, toID := range toAnyEventIDs {
+			if next == toID {
+				return true
+			}
+		}
+		// keep going back
+		ev, ok := eventIDMap[next]
+		if ok {
+			stack = append(stack, ev.PrevEventIDs()...)
+		}
+	}
+	return false
 }
