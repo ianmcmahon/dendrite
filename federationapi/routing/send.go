@@ -139,7 +139,7 @@ func (t *txnReq) processTransaction() (*gomatrixserverlib.RespSend, error) {
 
 	// Process the events.
 	for _, e := range pdus {
-		err := t.processEvent(e.Unwrap())
+		err := t.processEvent(e.Unwrap(), true)
 		if err != nil {
 			// If the error is due to the event itself being bad then we skip
 			// it and move onto the next event. We report an error so that the
@@ -218,7 +218,7 @@ func (t *txnReq) processEDUs(edus []gomatrixserverlib.EDU) {
 	}
 }
 
-func (t *txnReq) processEvent(e gomatrixserverlib.Event) error {
+func (t *txnReq) processEvent(e gomatrixserverlib.Event, isInboundTxn bool) error {
 	prevEventIDs := e.PrevEventIDs()
 
 	// Fetch the state needed to authenticate the event.
@@ -244,7 +244,7 @@ func (t *txnReq) processEvent(e gomatrixserverlib.Event) error {
 	}
 
 	if !stateResp.PrevEventsExist {
-		return t.processEventWithMissingState(e, stateResp.RoomVersion)
+		return t.processEventWithMissingState(e, stateResp.RoomVersion, isInboundTxn)
 	}
 
 	// Check that the event is allowed by the state at the event.
@@ -282,7 +282,7 @@ func checkAllowedByState(e gomatrixserverlib.Event, stateEvents []gomatrixserver
 	return gomatrixserverlib.Allowed(e, &authUsingState)
 }
 
-func (t *txnReq) processEventWithMissingState(e gomatrixserverlib.Event, roomVersion gomatrixserverlib.RoomVersion) error {
+func (t *txnReq) processEventWithMissingState(e gomatrixserverlib.Event, roomVersion gomatrixserverlib.RoomVersion, isInboundTxn bool) error {
 	// We are missing the previous events for this events.
 	// This means that there is a gap in our view of the history of the
 	// room. There two ways that we can handle such a gap:
@@ -299,7 +299,11 @@ func (t *txnReq) processEventWithMissingState(e gomatrixserverlib.Event, roomVer
 	// need to fallback to /state.
 
 	// Attempt to fill in the gap using /get_missing_events
-	ok, err := t.getMissingEvents(e, roomVersion)
+	// This will either:
+	// - fill in the gap completely then process event `e` returning ok=true err=nil
+	// - fail to fill in the gap and tell us to terminate the transaction ok=false, err=not nil
+	// - fail to fill in the gap and tell us to fetch state, and to not terminate the transaction, ok=false, err=nil
+	ok, err := t.getMissingEvents(e, roomVersion, isInboundTxn)
 	if err != nil {
 		return err
 	}
@@ -329,7 +333,7 @@ retryAllowedState:
 				if s.EventID() != missing.AuthEventID {
 					continue
 				}
-				err = t.processEventWithMissingState(s, roomVersion)
+				err = t.processEventWithMissingState(s, roomVersion, isInboundTxn)
 				// If there was no error retrieving the event from federation then
 				// we assume that it succeeded, so retry the original state check
 				if err == nil {
@@ -455,7 +459,9 @@ func (t *txnReq) createRespStateFromStateIDs(stateIDs gomatrixserverlib.RespStat
 
 // getMissingEvents return ok=true if missing events were fetched and handled, else false. Returns an error only if we should
 // terminate the transaction which initiated /get_missing_events
-func (t *txnReq) getMissingEvents(e gomatrixserverlib.Event, roomVersion gomatrixserverlib.RoomVersion) (ok bool, err error) {
+// This function recursively calls txnReq.processEvent with the missing events, which will be processed before this function returns.
+// This means that we may recursively call this function, as we spider back up prev_events to the min depth.
+func (t *txnReq) getMissingEvents(e gomatrixserverlib.Event, roomVersion gomatrixserverlib.RoomVersion, isInboundTxn bool) (ok bool, err error) {
 	logger := util.GetLogger(t.context).WithField("event_id", e.EventID()).WithField("room_id", e.RoomID())
 	// query latest events (forward extremities)
 	req := api.QueryLatestEventsAndStateRequest{
@@ -463,7 +469,7 @@ func (t *txnReq) getMissingEvents(e gomatrixserverlib.Event, roomVersion gomatri
 		StateToFetch: []gomatrixserverlib.StateKeyTuple{},
 	}
 	var res api.QueryLatestEventsAndStateResponse
-	if err := t.rsAPI.QueryLatestEventsAndState(t.context, &req, &res); err != nil {
+	if err = t.rsAPI.QueryLatestEventsAndState(t.context, &req, &res); err != nil {
 		logger.WithError(err).Warn("Failed to query latest events")
 		return false, nil
 	}
@@ -471,29 +477,53 @@ func (t *txnReq) getMissingEvents(e gomatrixserverlib.Event, roomVersion gomatri
 	for i := range res.LatestEvents {
 		latestEvents[i] = res.LatestEvents[i].EventID
 	}
-	// security: this server just sent us an event for which we do not know its prev_events - ask that server for those prev_events.
-	// https://github.com/matrix-org/synapse/pull/3456
-	// https://github.com/matrix-org/synapse/blob/229eb81498b0fe1da81e9b5b333a0285acde9446/synapse/handlers/federation.py#L335
+	// this server just sent us an event for which we do not know its prev_events - ask that server for those prev_events.
 	missingResp, err := t.federation.LookupMissingEvents(t.context, t.Origin, e.RoomID(), gomatrixserverlib.MissingEvents{
 		Limit: 20,
 		// synapse uses the min depth they've ever seen in that room
-		MinDepth: 1,
+		MinDepth: int(res.Depth) - 20,
 		// The latest event IDs that the sender already has. These are skipped when retrieving the previous events of latest_events.
 		EarliestEvents: latestEvents,
 		// The event IDs to retrieve the previous events for.
 		LatestEvents: []string{e.EventID()},
 	}, roomVersion)
-	if err != nil {
-		logger.WithError(err).Errorf(
-			"%s pushed us an event but couldn't give us details about prev_events via /get_missing_events - dropping this event until it can",
-			t.Origin,
-		)
-		return false, err
-	}
 
-	if !pathExists(missingResp.Events, e, latestEvents) {
+	// security: how we handle failures depends on whether or not this event will become the new forward extremity for the room.
+	// There's 2 scenarios to consider:
+	// - Case A: We got pushed an event and are now fetching missing prev_events. (isInboundTxn=true)
+	// - Case B: We are fetching missing prev_events already and now fetching some more  (isInboundTxn=false)
+	// In Case B, we know for sure that the event we are currently processing will not become the new forward extremity for the room,
+	// as it was called in response to an inbound txn which had it as a prev_event.
+	// In Case A, the event is a forward extremity, and could eventually become the _only_ forward extremity in the room. This is bad
+	// because it means we would trust the state at that event to be the state for the entire room, and allows rooms to be hijacked.
+	// https://github.com/matrix-org/synapse/pull/3456
+	// https://github.com/matrix-org/synapse/blob/229eb81498b0fe1da81e9b5b333a0285acde9446/synapse/handlers/federation.py#L335
+	if err != nil {
+		if isInboundTxn {
+			logger.WithError(err).Errorf(
+				"%s pushed us an event but couldn't give us details about prev_events via /get_missing_events - dropping this event until it can",
+				t.Origin,
+			)
+			return false, err
+		}
+		logger.WithError(err).Warnf(
+			"failed to lookup missing events for non-pushed event %s",
+			e.EventID(),
+		)
 		return false, nil
 	}
+
+	path := findPath(missingResp.Events, e, latestEvents)
+	if path == nil {
+		return false, nil
+	}
+	for _, e := range path {
+		err := t.processEvent(e, false)
+		if err != nil {
+			return false, err
+		}
+	}
+	t.processEvent(e, false)
 
 	// TODO: modify pathExists to return a valid path between the 2 events
 	return false, nil
@@ -501,7 +531,7 @@ func (t *txnReq) getMissingEvents(e gomatrixserverlib.Event, roomVersion gomatri
 
 // Attempts to find a path between fromEvent and toAnyEventIDs via events.
 // TODO: should exist in GMSL, does a DFS scan of the provided events trying to find a path toAnyEventIDs
-func pathExists(events []gomatrixserverlib.Event, fromEvent gomatrixserverlib.Event, toAnyEventIDs []string) bool {
+func findPath(events []gomatrixserverlib.Event, fromEvent gomatrixserverlib.Event, toAnyEventIDs []string) []gomatrixserverlib.Event {
 	eventIDMap := make(map[string]gomatrixserverlib.Event, len(events))
 	for _, ev := range events {
 		eventIDMap[ev.EventID()] = ev
