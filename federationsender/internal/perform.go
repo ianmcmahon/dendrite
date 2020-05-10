@@ -119,26 +119,29 @@ func (r *FederationSenderInternalAPI) PerformJoin(
 			continue
 		}
 
-		// Check that the send_join response was valid.
-		joinCtx := perform.JoinContext(r.federation, r.keyRing)
-		if err = joinCtx.CheckSendJoinResponse(
-			ctx, event, serverName, respMakeJoin, respSendJoin,
-		); err != nil {
-			logrus.WithError(err).Warnf("joinCtx.CheckSendJoinResponse failed")
-			continue
-		}
+		go func() {
+			ctx := context.Background()
+			// Check that the send_join response was valid.
+			joinCtx := perform.JoinContext(r.federation, r.keyRing)
+			if err = joinCtx.CheckSendJoinResponse(
+				ctx, event, serverName, respMakeJoin, respSendJoin,
+			); err != nil {
+				logrus.WithError(err).Warnf("joinCtx.CheckSendJoinResponse failed")
+				return
+			}
 
-		// If we successfully performed a send_join above then the other
-		// server now thinks we're a part of the room. Send the newly
-		// returned state to the roomserver to update our local view.
-		if err = r.producer.SendEventWithState(
-			ctx,
-			respSendJoin.ToRespState(),
-			event.Headered(respMakeJoin.RoomVersion),
-		); err != nil {
-			logrus.WithError(err).Warnf("r.producer.SendEventWithState failed")
-			continue
-		}
+			// If we successfully performed a send_join above then the other
+			// server now thinks we're a part of the room. Send the newly
+			// returned state to the roomserver to update our local view.
+			if err = r.producer.SendEventWithState(
+				ctx,
+				respSendJoin.ToRespState(),
+				event.Headered(respMakeJoin.RoomVersion),
+			); err != nil {
+				logrus.WithError(err).Warnf("r.producer.SendEventWithState failed")
+				return
+			}
+		}()
 
 		// We're all good.
 		r.statistics.ForServer(serverName).Success()
